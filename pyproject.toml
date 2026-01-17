@@ -4,5 +4,15 @@ version = "0.1.0"
 description = "A minimal WebSocket server and client demo"
 requires-python = ">=3.11"
 dependencies = [
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-exporter-otlp>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
     "websockets>=12.0",
 ]
+
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "client"]
