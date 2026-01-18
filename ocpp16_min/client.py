@@ -23,6 +23,7 @@ from .common import (
     make_status_notification_call,
     make_start_transaction_call,
     make_stop_transaction_call,
+    make_meter_values_call,
     new_uid,
     parse_call_result_payload,
     parse_message,
@@ -102,12 +103,55 @@ async def _heartbeat_loop(
         logger.info("Heartbeat %s acknowledged", idx + 1)
 
 
+async def _meter_values_loop(
+    websocket: websockets.WebSocketClientProtocol,
+    interval: int,
+    ws_lock: asyncio.Lock,
+    transaction_id: int,
+    energy_state: dict[str, int],
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        await asyncio.sleep(interval)
+        if stop_event.is_set():
+            return
+        energy_state["value"] += 100
+        meter_call = make_meter_values_call(
+            connector_id=1,
+            transaction_id=transaction_id,
+            energy_wh=energy_state["value"],
+        )
+        meter_uid = meter_call[1]
+        async with ws_lock:
+            await websocket.send(json.dumps(meter_call))
+            logger.info("MeterValues sent (energy_wh=%s)", energy_state["value"])
+            meter_response_text = await websocket.recv()
+        logger.info("RAW RESPONSE: %s", meter_response_text)
+        try:
+            meter_response = parse_message(meter_response_text)
+        except json.JSONDecodeError:
+            logger.error("MeterValues: invalid JSON response")
+            return
+        logger.info("PARSED RESPONSE: %s", meter_response)
+        if not is_call_result(meter_response) or meter_response[1] != meter_uid:
+            logger.error("MeterValues: invalid CALLRESULT")
+            return
+        try:
+            parse_call_result_payload(meter_response)
+        except ValueError as exc:
+            logger.error("MeterValues response error: %s", exc)
+            return
+        logger.info("MeterValues acknowledged")
+
+
 async def main() -> int:
     setup_tracing()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
     logger.addHandler(SpanEventHandler())
     state = BOOTING
-    uri = "ws://localhost:9000/CP_1"
+    host = os.getenv("APP_HOST", "localhost")
+    port = int(os.getenv("APP_PORT", "9000"))
+    uri = f"ws://{host}:{port}/CP_1"
     uid = new_uid()
     payload = _boot_notification_payload()
     message = json.dumps(make_call(uid, "BootNotification", payload))
@@ -220,7 +264,7 @@ async def main() -> int:
                     transaction_id=transaction_id,
                     connector_id=1,
                     meter_start=0,
-                    meter_stop=42,
+                    meter_stop=0,
                 )
                 logger.info("StartTransaction acknowledged (transactionId=%s)", session.transaction_id)
 
@@ -228,8 +272,23 @@ async def main() -> int:
                 heartbeat_task = asyncio.create_task(
                     _heartbeat_loop(websocket, interval, ws_lock, max_count=3)
                 )
+                meter_stop_event = asyncio.Event()
+                energy_state = {"value": session.meter_start}
+                meter_task = asyncio.create_task(
+                    _meter_values_loop(
+                        websocket,
+                        interval=5,
+                        ws_lock=ws_lock,
+                        transaction_id=session.transaction_id,
+                        energy_state=energy_state,
+                        stop_event=meter_stop_event,
+                    )
+                )
                 await asyncio.sleep(10)
+                meter_stop_event.set()
+                await meter_task
 
+                session.meter_stop = energy_state["value"]
                 stop_call = make_stop_transaction_call(
                     transaction_id=session.transaction_id,
                     id_tag="TEST",
@@ -265,7 +324,7 @@ async def main() -> int:
                 await heartbeat_task
                 return 0
         except ConnectionRefusedError:
-            logger.error("Could not connect to server")
+            logger.error("Could not connect to server at %s", uri)
             return 1
 
 

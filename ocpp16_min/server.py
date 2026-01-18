@@ -180,11 +180,44 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
                         meter_stop,
                     )
                     result_payload = {"idTagInfo": {"status": "Accepted"}}
+                elif action == "MeterValues":
+                    connector_id = payload.get("connectorId")
+                    meter_value = payload.get("meterValue")
+                    transaction_id = payload.get("transactionId")
+                    if connector_id not in (0, 1):
+                        await _send_error_and_close(websocket, "ERROR: connectorId must be 0 or 1")
+                        return
+                    if not isinstance(meter_value, list) or not meter_value:
+                        await _send_error_and_close(websocket, "ERROR: meterValue must be a non-empty list")
+                        return
+                    first = meter_value[0]
+                    if not isinstance(first, dict):
+                        await _send_error_and_close(websocket, "ERROR: meterValue entry must be an object")
+                        return
+                    timestamp = first.get("timestamp")
+                    sampled = first.get("sampledValue")
+                    if not isinstance(sampled, list) or not sampled:
+                        await _send_error_and_close(websocket, "ERROR: sampledValue must be a non-empty list")
+                        return
+                    first_sample = sampled[0]
+                    if not isinstance(first_sample, dict):
+                        await _send_error_and_close(websocket, "ERROR: sampledValue entry must be an object")
+                        return
+                    value = first_sample.get("value")
+                    logger.info(
+                        "MeterValues: chargePointId=%s connectorId=%s transactionId=%s timestamp=%s value=%s",
+                        charge_point_id,
+                        connector_id,
+                        transaction_id,
+                        timestamp,
+                        value,
+                    )
+                    result_payload = {}
                 else:
                     error = _call_error(
                         uid,
                         "NotSupported",
-                        "Only BootNotification, Heartbeat, StatusNotification, StartTransaction, and StopTransaction are supported",
+                        "Only BootNotification, Heartbeat, StatusNotification, StartTransaction, StopTransaction, and MeterValues are supported",
                     )
                     error_text = json.dumps(error)
                     await websocket.send(error_text)

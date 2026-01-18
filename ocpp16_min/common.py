@@ -100,6 +100,32 @@ def make_stop_transaction_call(
     return make_call(uid or new_uid(), "StopTransaction", payload)
 
 
+def make_meter_values_call(
+    uid: str | None = None,
+    connector_id: int = 1,
+    transaction_id: int | None = None,
+    energy_wh: int = 0,
+    timestamp: str | None = None,
+) -> list[Any]:
+    entry = {
+        "timestamp": timestamp or utc_now_iso_z(),
+        "sampledValue": [
+            {
+                "value": str(energy_wh),
+                "measurand": "Energy.Active.Import.Register",
+                "unit": "Wh",
+            }
+        ],
+    }
+    payload: dict[str, Any] = {
+        "connectorId": connector_id,
+        "meterValue": [entry],
+    }
+    if transaction_id is not None:
+        payload["transactionId"] = transaction_id
+    return make_call(uid or new_uid(), "MeterValues", payload)
+
+
 def utc_now_iso_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 

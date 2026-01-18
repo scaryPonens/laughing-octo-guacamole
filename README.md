@@ -5,7 +5,7 @@ charge point emulator and a server over WebSockets.
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.10+
 - `uv` (https://docs.astral.sh/uv/)
 
 ## Setup (uv)
@@ -34,7 +34,8 @@ uv run python -m ocpp16_min.client
 Client connects to `ws://localhost:9000/CP_1`, sends a BootNotification,
 sends one StatusNotification (Available), then StartTransaction and
 StopTransaction (after ~10 seconds). Heartbeats run during the
-simulated session. Exits with code 0 only on success.
+simulated session and MeterValues are sent every 5 seconds. Exits with
+code 0 only on success.
 
 ## Tracing (OpenTelemetry + Jaeger)
 
@@ -69,9 +70,17 @@ INFO - Sent: [3,"... ",{"transactionId":1,"idTagInfo":{"status":"Accepted"}}]
 INFO - Received raw: [2,"...","Heartbeat",{}]
 INFO - Parsed CALL: action=Heartbeat uid=...
 INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:06Z"}]
-INFO - Received raw: [2,"...","StopTransaction",{"transactionId":1,"meterStop":42,"timestamp":"...","reason":"Local","idTag":"TEST"}]
+INFO - Received raw: [2,"...","MeterValues",{"connectorId":1,"transactionId":1,"meterValue":[...]}]
+INFO - Parsed CALL: action=MeterValues uid=...
+INFO - MeterValues: chargePointId=CP_1 connectorId=1 transactionId=1 timestamp=... value=100
+INFO - Sent: [3,"... ",{}]
+INFO - Received raw: [2,"...","MeterValues",{"connectorId":1,"transactionId":1,"meterValue":[...]}]
+INFO - Parsed CALL: action=MeterValues uid=...
+INFO - MeterValues: chargePointId=CP_1 connectorId=1 transactionId=1 timestamp=... value=200
+INFO - Sent: [3,"... ",{}]
+INFO - Received raw: [2,"...","StopTransaction",{"transactionId":1,"meterStop":200,"timestamp":"...","reason":"Local","idTag":"TEST"}]
 INFO - Parsed CALL: action=StopTransaction uid=...
-INFO - StopTransaction: transactionId=1 meterStop=42
+INFO - StopTransaction: transactionId=1 meterStop=200
 INFO - Sent: [3,"... ",{"idTagInfo":{"status":"Accepted"}}]
 INFO - Client disconnected: CP_1
 ```
@@ -92,6 +101,14 @@ Heartbeat 1 sent
 RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:06Z"}]
 PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:06Z'}
 Heartbeat 1 acknowledged
+MeterValues sent (energy_wh=100)
+RAW RESPONSE: [3,"... ",{}]
+PARSED RESPONSE: {}
+MeterValues acknowledged
+MeterValues sent (energy_wh=200)
+RAW RESPONSE: [3,"... ",{}]
+PARSED RESPONSE: {}
+MeterValues acknowledged
 StopTransaction sent (transactionId=1)
 RAW RESPONSE: [3,"... ",{"idTagInfo":{"status":"Accepted"}}]
 PARSED RESPONSE: {'idTagInfo': {'status': 'Accepted'}}
