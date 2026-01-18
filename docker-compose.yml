@@ -26,6 +26,8 @@ services:
       - APP_PORT=9000
       - OTEL_SERVICE_NAME=ocpp16-server
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - UV_PROJECT_ENVIRONMENT=/tmp/uv-venv
+      - UV_VENV_PATH=/tmp/uv-venv
     volumes:
       - .:/app
     ports:

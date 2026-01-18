@@ -5,6 +5,9 @@ import atexit
 import json
 import logging
 import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 
 import websockets
 from opentelemetry import propagate, trace
@@ -15,21 +18,56 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from websockets.exceptions import ConnectionClosed
 
 try:
-    from .common import make_call_result, parse_message, utc_now_iso_z, validate_call
+    from .common import (
+        coerce_int,
+        make_call_error,
+        make_call_result,
+        parse_iso_z,
+        parse_message,
+        utc_now_iso_z,
+        validate_call,
+    )
 except ImportError:  # Allows running as a script without -m
-    from common import make_call_result, parse_message, utc_now_iso_z, validate_call
+    from common import (
+        coerce_int,
+        make_call_error,
+        make_call_result,
+        parse_iso_z,
+        parse_message,
+        utc_now_iso_z,
+        validate_call,
+    )
 
 CALL = 2
 CALL_RESULT = 3
 CALL_ERROR = 4
 HEARTBEAT_INTERVAL_SECONDS = 10
+
 _next_transaction_id = 1
-_active_transactions: dict[int, dict[str, object]] = {}
+
+
+@dataclass
+class ChargePointSession:
+    connected: bool = False
+    connected_at: datetime | None = None
+    disconnected_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    boot_accepted: bool = False
+    boot_info: dict | None = None
+    last_heartbeat_at: datetime | None = None
+    status: str | None = None
+    connector_id: int | None = None
+    active_transaction_id: int | None = None
+    transactions: dict[int, dict] = field(default_factory=dict)
+    last_meter_wh: int | None = None
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+raw_logger = logging.getLogger("ocpp.raw")
 tracer = trace.get_tracer(__name__)
+
+_sessions: dict[str, ChargePointSession] = {}
 
 
 def setup_tracing() -> None:
@@ -42,6 +80,18 @@ def setup_tracing() -> None:
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
     atexit.register(provider.shutdown)
+
+
+def setup_raw_logging() -> None:
+    if raw_logger.handlers:
+        return
+    os.makedirs("logs", exist_ok=True)
+    handler = RotatingFileHandler("logs/ocpp_raw.log", maxBytes=1_000_000, backupCount=3)
+    formatter = logging.Formatter("%(asctime)s %(message)s")
+    handler.setFormatter(formatter)
+    raw_logger.setLevel(logging.INFO)
+    raw_logger.addHandler(handler)
+    raw_logger.propagate = False
 
 
 class SpanEventHandler(logging.Handler):
@@ -58,8 +108,186 @@ class SpanEventHandler(logging.Handler):
             )
 
 
-def _call_error(uid: str, code: str, description: str) -> list[object]:
-    return [CALL_ERROR, uid, code, description, {}]
+class ValidationError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _get_session(charge_point_id: str) -> ChargePointSession:
+    session = _sessions.get(charge_point_id)
+    if session is None:
+        session = ChargePointSession()
+        _sessions[charge_point_id] = session
+    return session
+
+
+def _raw_log(direction: str, charge_point_id: str, text: str) -> None:
+    raw_logger.info("%s %s %s", charge_point_id, direction, text)
+
+
+def _compact_log(
+    charge_point_id: str,
+    direction: str,
+    action: str,
+    uid: str,
+    summary: dict[str, object] | None = None,
+) -> None:
+    ts = utc_now_iso_z()
+    compact = summary or {}
+    logger.info(
+        "%s cp=%s dir=%s action=%s uid=%s summary=%s",
+        ts,
+        charge_point_id,
+        direction,
+        action,
+        uid,
+        compact,
+    )
+
+
+def _summary_for(action: str, payload: dict[str, object]) -> dict[str, object]:
+    if action == "BootNotification":
+        return {
+            "vendor": payload.get("chargePointVendor"),
+            "model": payload.get("chargePointModel"),
+        }
+    if action == "Heartbeat":
+        return {}
+    if action == "StatusNotification":
+        return {
+            "connectorId": payload.get("connectorId"),
+            "status": payload.get("status"),
+            "errorCode": payload.get("errorCode"),
+        }
+    if action == "StartTransaction":
+        return {
+            "connectorId": payload.get("connectorId"),
+            "idTag": payload.get("idTag"),
+            "meterStart": payload.get("meterStart"),
+        }
+    if action == "StopTransaction":
+        return {
+            "transactionId": payload.get("transactionId"),
+            "meterStop": payload.get("meterStop"),
+        }
+    if action == "MeterValues":
+        return {
+            "connectorId": payload.get("connectorId"),
+            "transactionId": payload.get("transactionId"),
+        }
+    return {}
+
+
+def _validate_payload(action: str, payload: dict[str, object]) -> None:
+    if action == "BootNotification":
+        if not isinstance(payload.get("chargePointVendor"), str):
+            raise ValidationError("PropertyConstraintViolation", "chargePointVendor must be a string")
+        if not isinstance(payload.get("chargePointModel"), str):
+            raise ValidationError("PropertyConstraintViolation", "chargePointModel must be a string")
+        return
+
+    if action == "Heartbeat":
+        return
+
+    if action == "StatusNotification":
+        connector_id = payload.get("connectorId")
+        status = payload.get("status")
+        error_code = payload.get("errorCode")
+        if connector_id not in (0, 1):
+            raise ValidationError("PropertyConstraintViolation", "connectorId must be 0 or 1")
+        if status != "Available":
+            raise ValidationError("PropertyConstraintViolation", "status must be Available")
+        if error_code != "NoError":
+            raise ValidationError("PropertyConstraintViolation", "errorCode must be NoError")
+        return
+
+    if action == "StartTransaction":
+        connector_id = payload.get("connectorId")
+        if connector_id not in (0, 1):
+            raise ValidationError("PropertyConstraintViolation", "connectorId must be 0 or 1")
+        if not isinstance(payload.get("idTag"), str) or not payload.get("idTag"):
+            raise ValidationError("PropertyConstraintViolation", "idTag must be a non-empty string")
+        coerce_int(payload.get("meterStart"), "meterStart")
+        parse_iso_z(payload.get("timestamp"), "timestamp")
+        return
+
+    if action == "StopTransaction":
+        coerce_int(payload.get("transactionId"), "transactionId")
+        coerce_int(payload.get("meterStop"), "meterStop")
+        parse_iso_z(payload.get("timestamp"), "timestamp")
+        return
+
+    if action == "MeterValues":
+        connector_id = payload.get("connectorId")
+        meter_value = payload.get("meterValue")
+        if connector_id not in (0, 1):
+            raise ValidationError("PropertyConstraintViolation", "connectorId must be 0 or 1")
+        if not isinstance(meter_value, list) or not meter_value:
+            raise ValidationError("PropertyConstraintViolation", "meterValue must be a non-empty list")
+        first = meter_value[0]
+        if not isinstance(first, dict):
+            raise ValidationError("PropertyConstraintViolation", "meterValue entry must be an object")
+        parse_iso_z(first.get("timestamp"), "timestamp")
+        sampled = first.get("sampledValue")
+        if not isinstance(sampled, list) or not sampled:
+            raise ValidationError("PropertyConstraintViolation", "sampledValue must be a non-empty list")
+        first_sample = sampled[0]
+        if not isinstance(first_sample, dict):
+            raise ValidationError("PropertyConstraintViolation", "sampledValue entry must be an object")
+        if "value" not in first_sample:
+            raise ValidationError("PropertyConstraintViolation", "sampledValue.value is required")
+        return
+
+    raise ValidationError("PropertyConstraintViolation", "unsupported action")
+
+
+def _send_call_error(
+    websocket: websockets.WebSocketServerProtocol,
+    charge_point_id: str,
+    uid: str,
+    code: str,
+    description: str,
+    action: str,
+) -> asyncio.Task:
+    frame = make_call_error(uid, code, description)
+    text = json.dumps(frame)
+    _compact_log(charge_point_id, "TX", action, uid, {"error": code, "message": description})
+    _raw_log("TX", charge_point_id, text)
+    return asyncio.create_task(websocket.send(text))
+
+
+async def _send_call_result(
+    websocket: websockets.WebSocketServerProtocol,
+    charge_point_id: str,
+    uid: str,
+    action: str,
+    payload: dict[str, object],
+) -> None:
+    frame = make_call_result(uid, payload)
+    text = json.dumps(frame)
+    _compact_log(charge_point_id, "TX", action, uid, {"result": True})
+    _raw_log("TX", charge_point_id, text)
+    await websocket.send(text)
+
+
+def _dump_state_summary() -> dict[str, object]:
+    items = []
+    for cp_id, session in _sessions.items():
+        items.append(
+            {
+                "chargePointId": cp_id,
+                "boot_accepted": session.boot_accepted,
+                "active_transaction_id": session.active_transaction_id,
+                "last_seen_at": session.last_seen_at.isoformat() if session.last_seen_at else None,
+                "last_meter_wh": session.last_meter_wh,
+            }
+        )
+    return {"sessions": items}
 
 
 async def _send_error_and_close(websocket: websockets.WebSocketServerProtocol, text: str) -> None:
@@ -73,6 +301,11 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
     if path is None and request is not None:
         path = getattr(request, "path", None)
     charge_point_id = ((path or "/").lstrip("/")) or "unknown"
+
+    session = _get_session(charge_point_id)
+    session.connected = True
+    session.connected_at = _now()
+    session.last_seen_at = _now()
     logger.info("Client connected: %s", charge_point_id)
 
     try:
@@ -84,158 +317,142 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
 
         parent_context = propagate.extract(request_headers)
         async for message in websocket:
+            session.last_seen_at = _now()
+            _raw_log("RX", charge_point_id, message)
+            if message == "DUMP_STATE":
+                summary = _dump_state_summary()
+                text = json.dumps(summary)
+                _compact_log(charge_point_id, "TX", "DUMP_STATE", "-", {"sessions": len(summary["sessions"])})
+                _raw_log("TX", charge_point_id, text)
+                await websocket.send(text)
+                continue
+
             with tracer.start_as_current_span("ws.message", context=parent_context) as span:
                 span.set_attribute("ocpp.charge_point_id", charge_point_id)
                 span.set_attribute("ws.message_length", len(message))
-                logger.info("Received raw: %s", message)
 
                 try:
                     data = parse_message(message)
                 except json.JSONDecodeError as exc:
-                    await _send_error_and_close(websocket, f"ERROR: invalid JSON ({exc.msg})")
+                    logger.error("Invalid JSON from %s: %s", charge_point_id, exc.msg)
+                    await _send_error_and_close(websocket, "ERROR: invalid JSON")
                     return
 
                 try:
                     uid, action, payload = validate_call(data)
                 except ValueError as exc:
-                    await _send_error_and_close(websocket, f"ERROR: {exc}")
+                    uid = data[1] if isinstance(data, list) and len(data) > 1 and isinstance(data[1], str) else "UNKNOWN"
+                    _compact_log(charge_point_id, "RX", "INVALID", uid, {"error": str(exc)})
+                    if uid != "UNKNOWN":
+                        await _send_call_error(
+                            websocket,
+                            charge_point_id,
+                            uid,
+                            "FormationViolation",
+                            str(exc),
+                            "INVALID",
+                        )
+                        continue
+                    await _send_error_and_close(websocket, "ERROR: invalid CALL frame")
                     return
 
-                logger.info("Parsed CALL: action=%s uid=%s", action, uid)
+                summary = _summary_for(action, payload)
+                _compact_log(charge_point_id, "RX", action, uid, summary)
+
+                try:
+                    _validate_payload(action, payload)
+                except ValidationError as exc:
+                    await _send_call_error(websocket, charge_point_id, uid, exc.code, str(exc), action)
+                    continue
 
                 if action == "BootNotification":
+                    session.boot_accepted = True
+                    session.boot_info = payload
                     result_payload = {
                         "status": "Accepted",
                         "currentTime": utc_now_iso_z(),
                         "interval": HEARTBEAT_INTERVAL_SECONDS,
                     }
                 elif action == "Heartbeat":
+                    session.last_heartbeat_at = _now()
                     result_payload = {"currentTime": utc_now_iso_z()}
                 elif action == "StatusNotification":
-                    connector_id = payload.get("connectorId")
-                    status = payload.get("status")
-                    error_code = payload.get("errorCode")
-                    if connector_id not in (0, 1):
-                        await _send_error_and_close(websocket, "ERROR: connectorId must be 0 or 1")
-                        return
-                    if status != "Available":
-                        await _send_error_and_close(websocket, "ERROR: status must be Available")
-                        return
-                    if error_code != "NoError":
-                        await _send_error_and_close(websocket, "ERROR: errorCode must be NoError")
-                        return
-                    logger.info("StatusNotification: connectorId=%s status=%s", connector_id, status)
+                    session.status = str(payload.get("status"))
+                    session.connector_id = int(payload.get("connectorId"))
                     result_payload = {}
                 elif action == "StartTransaction":
-                    connector_id = payload.get("connectorId")
-                    id_tag = payload.get("idTag")
-                    meter_start = payload.get("meterStart")
-                    timestamp = payload.get("timestamp")
-                    if connector_id not in (0, 1):
-                        await _send_error_and_close(websocket, "ERROR: connectorId must be 0 or 1")
-                        return
-                    if not isinstance(id_tag, str) or not id_tag:
-                        await _send_error_and_close(websocket, "ERROR: idTag must be a non-empty string")
-                        return
-                    if not isinstance(meter_start, int):
-                        await _send_error_and_close(websocket, "ERROR: meterStart must be an integer")
-                        return
-                    if not isinstance(timestamp, str) or not timestamp:
-                        await _send_error_and_close(websocket, "ERROR: timestamp must be a string")
-                        return
                     global _next_transaction_id
                     transaction_id = _next_transaction_id
                     _next_transaction_id += 1
-                    _active_transactions[transaction_id] = {
-                        "chargePointId": charge_point_id,
-                        "connectorId": connector_id,
-                        "meterStart": meter_start,
+                    session.active_transaction_id = transaction_id
+                    session.transactions[transaction_id] = {
+                        "started_at": _now().isoformat(),
+                        "meterStart": int(payload.get("meterStart")),
+                        "idTag": payload.get("idTag"),
+                        "connectorId": payload.get("connectorId"),
+                    }
+                    result_payload = {
+                        "transactionId": transaction_id,
+                        "idTagInfo": {"status": "Accepted"},
                     }
                     logger.info(
                         "StartTransaction: chargePointId=%s transactionId=%s",
                         charge_point_id,
                         transaction_id,
                     )
-                    result_payload = {
-                        "transactionId": transaction_id,
-                        "idTagInfo": {"status": "Accepted"},
-                    }
                 elif action == "StopTransaction":
-                    transaction_id = payload.get("transactionId")
-                    meter_stop = payload.get("meterStop")
-                    timestamp = payload.get("timestamp")
-                    if not isinstance(transaction_id, int):
-                        await _send_error_and_close(websocket, "ERROR: transactionId must be an integer")
-                        return
-                    if not isinstance(meter_stop, int):
-                        await _send_error_and_close(websocket, "ERROR: meterStop must be an integer")
-                        return
-                    if not isinstance(timestamp, str) or not timestamp:
-                        await _send_error_and_close(websocket, "ERROR: timestamp must be a string")
-                        return
-                    _active_transactions.pop(transaction_id, None)
+                    transaction_id = coerce_int(payload.get("transactionId"), "transactionId")
+                    meter_stop = coerce_int(payload.get("meterStop"), "meterStop")
+                    session.active_transaction_id = None
+                    session.last_meter_wh = meter_stop
+                    tx = session.transactions.get(transaction_id, {})
+                    tx.update({"stopped_at": _now().isoformat(), "meterStop": meter_stop})
+                    session.transactions[transaction_id] = tx
+                    result_payload = {"idTagInfo": {"status": "Accepted"}}
                     logger.info(
                         "StopTransaction: transactionId=%s meterStop=%s",
                         transaction_id,
                         meter_stop,
                     )
-                    result_payload = {"idTagInfo": {"status": "Accepted"}}
                 elif action == "MeterValues":
-                    connector_id = payload.get("connectorId")
                     meter_value = payload.get("meterValue")
-                    transaction_id = payload.get("transactionId")
-                    if connector_id not in (0, 1):
-                        await _send_error_and_close(websocket, "ERROR: connectorId must be 0 or 1")
-                        return
-                    if not isinstance(meter_value, list) or not meter_value:
-                        await _send_error_and_close(websocket, "ERROR: meterValue must be a non-empty list")
-                        return
-                    first = meter_value[0]
-                    if not isinstance(first, dict):
-                        await _send_error_and_close(websocket, "ERROR: meterValue entry must be an object")
-                        return
-                    timestamp = first.get("timestamp")
-                    sampled = first.get("sampledValue")
-                    if not isinstance(sampled, list) or not sampled:
-                        await _send_error_and_close(websocket, "ERROR: sampledValue must be a non-empty list")
-                        return
-                    first_sample = sampled[0]
-                    if not isinstance(first_sample, dict):
-                        await _send_error_and_close(websocket, "ERROR: sampledValue entry must be an object")
-                        return
-                    value = first_sample.get("value")
+                    first = meter_value[0] if isinstance(meter_value, list) and meter_value else {}
+                    sampled = first.get("sampledValue") if isinstance(first, dict) else []
+                    first_sample = sampled[0] if isinstance(sampled, list) and sampled else {}
+                    value = coerce_int(first_sample.get("value"), "sampledValue.value")
+                    session.last_meter_wh = value
+                    result_payload = {}
                     logger.info(
                         "MeterValues: chargePointId=%s connectorId=%s transactionId=%s timestamp=%s value=%s",
                         charge_point_id,
-                        connector_id,
-                        transaction_id,
-                        timestamp,
+                        payload.get("connectorId"),
+                        payload.get("transactionId"),
+                        first.get("timestamp"),
                         value,
                     )
-                    result_payload = {}
                 else:
-                    error = _call_error(
+                    await _send_call_error(
+                        websocket,
+                        charge_point_id,
                         uid,
                         "NotSupported",
-                        "Only BootNotification, Heartbeat, StatusNotification, StartTransaction, StopTransaction, and MeterValues are supported",
+                        "Action not supported",
+                        action,
                     )
-                    error_text = json.dumps(error)
-                    await websocket.send(error_text)
-                    logger.info("Sent: %s", error_text)
                     continue
 
-                response = make_call_result(uid, result_payload)
-                response_text = json.dumps(response)
-                await websocket.send(response_text)
-                logger.info("Sent: %s", response_text)
+                await _send_call_result(websocket, charge_point_id, uid, action, result_payload)
     except ConnectionClosed:
         pass
     finally:
+        session.connected = False
+        session.disconnected_at = _now()
         logger.info("Client disconnected: %s", charge_point_id)
 
 
 async def main() -> None:
     setup_tracing()
+    setup_raw_logging()
     logger.addHandler(SpanEventHandler())
     host = os.getenv("APP_HOST", "localhost")
     port = int(os.getenv("APP_PORT", "9000"))

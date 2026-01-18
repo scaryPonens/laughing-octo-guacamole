@@ -18,6 +18,10 @@ def make_call_result(uid: str, payload: dict[str, Any]) -> list[Any]:
     return [3, uid, payload]
 
 
+def make_call_error(uid: str, code: str, description: str, details: dict[str, Any] | None = None) -> list[Any]:
+    return [4, uid, code, description, details or {}]
+
+
 def new_uid() -> str:
     return uuid4().hex
 
@@ -141,6 +145,23 @@ def parse_call_result_payload(msg: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("CALLRESULT payload must be an object")
     return payload
+
+
+def coerce_int(value: Any, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+
+
+def parse_iso_z(text: Any, field_name: str) -> datetime:
+    if not isinstance(text, str) or not text:
+        raise ValueError(f"{field_name} must be a string")
+    normalized = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be ISO-8601") from exc
 
 
 @dataclass

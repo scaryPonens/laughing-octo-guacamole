@@ -11,7 +11,7 @@
   "github.copilot.chat.agent.autoFix": true,
   "chat.tools.autoApprove": false,
   "python.testing.pytestArgs": [
-    "ocpp16_min"
+    "tests/"
   ],
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
