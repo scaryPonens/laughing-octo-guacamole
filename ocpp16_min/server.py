@@ -23,6 +23,8 @@ CALL = 2
 CALL_RESULT = 3
 CALL_ERROR = 4
 HEARTBEAT_INTERVAL_SECONDS = 10
+_next_transaction_id = 1
+_active_transactions: dict[int, dict[str, object]] = {}
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -109,8 +111,81 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
                     }
                 elif action == "Heartbeat":
                     result_payload = {"currentTime": utc_now_iso_z()}
+                elif action == "StatusNotification":
+                    connector_id = payload.get("connectorId")
+                    status = payload.get("status")
+                    error_code = payload.get("errorCode")
+                    if connector_id not in (0, 1):
+                        await _send_error_and_close(websocket, "ERROR: connectorId must be 0 or 1")
+                        return
+                    if status != "Available":
+                        await _send_error_and_close(websocket, "ERROR: status must be Available")
+                        return
+                    if error_code != "NoError":
+                        await _send_error_and_close(websocket, "ERROR: errorCode must be NoError")
+                        return
+                    logger.info("StatusNotification: connectorId=%s status=%s", connector_id, status)
+                    result_payload = {}
+                elif action == "StartTransaction":
+                    connector_id = payload.get("connectorId")
+                    id_tag = payload.get("idTag")
+                    meter_start = payload.get("meterStart")
+                    timestamp = payload.get("timestamp")
+                    if connector_id not in (0, 1):
+                        await _send_error_and_close(websocket, "ERROR: connectorId must be 0 or 1")
+                        return
+                    if not isinstance(id_tag, str) or not id_tag:
+                        await _send_error_and_close(websocket, "ERROR: idTag must be a non-empty string")
+                        return
+                    if not isinstance(meter_start, int):
+                        await _send_error_and_close(websocket, "ERROR: meterStart must be an integer")
+                        return
+                    if not isinstance(timestamp, str) or not timestamp:
+                        await _send_error_and_close(websocket, "ERROR: timestamp must be a string")
+                        return
+                    global _next_transaction_id
+                    transaction_id = _next_transaction_id
+                    _next_transaction_id += 1
+                    _active_transactions[transaction_id] = {
+                        "chargePointId": charge_point_id,
+                        "connectorId": connector_id,
+                        "meterStart": meter_start,
+                    }
+                    logger.info(
+                        "StartTransaction: chargePointId=%s transactionId=%s",
+                        charge_point_id,
+                        transaction_id,
+                    )
+                    result_payload = {
+                        "transactionId": transaction_id,
+                        "idTagInfo": {"status": "Accepted"},
+                    }
+                elif action == "StopTransaction":
+                    transaction_id = payload.get("transactionId")
+                    meter_stop = payload.get("meterStop")
+                    timestamp = payload.get("timestamp")
+                    if not isinstance(transaction_id, int):
+                        await _send_error_and_close(websocket, "ERROR: transactionId must be an integer")
+                        return
+                    if not isinstance(meter_stop, int):
+                        await _send_error_and_close(websocket, "ERROR: meterStop must be an integer")
+                        return
+                    if not isinstance(timestamp, str) or not timestamp:
+                        await _send_error_and_close(websocket, "ERROR: timestamp must be a string")
+                        return
+                    _active_transactions.pop(transaction_id, None)
+                    logger.info(
+                        "StopTransaction: transactionId=%s meterStop=%s",
+                        transaction_id,
+                        meter_stop,
+                    )
+                    result_payload = {"idTagInfo": {"status": "Accepted"}}
                 else:
-                    error = _call_error(uid, "NotSupported", "Only BootNotification and Heartbeat are supported")
+                    error = _call_error(
+                        uid,
+                        "NotSupported",
+                        "Only BootNotification, Heartbeat, StatusNotification, StartTransaction, and StopTransaction are supported",
+                    )
                     error_text = json.dumps(error)
                     await websocket.send(error_text)
                     logger.info("Sent: %s", error_text)

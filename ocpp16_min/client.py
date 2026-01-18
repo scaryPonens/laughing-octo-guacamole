@@ -15,11 +15,18 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from .common import (
+    AVAILABLE,
+    BOOTING,
     is_call_result,
     make_call,
     make_heartbeat_call,
+    make_status_notification_call,
+    make_start_transaction_call,
+    make_stop_transaction_call,
     new_uid,
+    parse_call_result_payload,
     parse_message,
+    SessionState,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,10 +67,46 @@ class SpanEventHandler(logging.Handler):
             )
 
 
+async def _heartbeat_loop(
+    websocket: websockets.WebSocketClientProtocol,
+    interval: int,
+    ws_lock: asyncio.Lock,
+    max_count: int = 3,
+) -> None:
+    for idx in range(max_count):
+        await asyncio.sleep(interval)
+        heartbeat_call = make_heartbeat_call()
+        heartbeat_uid = heartbeat_call[1]
+        async with ws_lock:
+            await websocket.send(json.dumps(heartbeat_call))
+            logger.info("Heartbeat %s sent", idx + 1)
+            heartbeat_response_text = await websocket.recv()
+        logger.info("RAW RESPONSE: %s", heartbeat_response_text)
+        try:
+            heartbeat_response = parse_message(heartbeat_response_text)
+        except json.JSONDecodeError:
+            logger.error("Heartbeat %s: invalid JSON response", idx + 1)
+            return
+        logger.info("PARSED RESPONSE: %s", heartbeat_response)
+        if (
+            not is_call_result(heartbeat_response)
+            or heartbeat_response[1] != heartbeat_uid
+        ):
+            logger.error("Heartbeat %s: invalid CALLRESULT", idx + 1)
+            return
+        try:
+            parse_call_result_payload(heartbeat_response)
+        except ValueError as exc:
+            logger.error("Heartbeat %s: response error: %s", idx + 1, exc)
+            return
+        logger.info("Heartbeat %s acknowledged", idx + 1)
+
+
 async def main() -> int:
     setup_tracing()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
     logger.addHandler(SpanEventHandler())
+    state = BOOTING
     uri = "ws://localhost:9000/CP_1"
     uid = new_uid()
     payload = _boot_notification_payload()
@@ -93,12 +136,17 @@ async def main() -> int:
                     return 1
 
                 logger.info("PARSED RESPONSE: %s", response)
-                if not is_call_result(response) or response[1] != uid or not isinstance(response[2], dict):
+                if not is_call_result(response) or response[1] != uid:
                     logger.error("BootNotification response is not a valid CALLRESULT")
                     span.set_attribute("ws.response_status", "Invalid")
                     return 1
 
-                boot_payload = response[2]
+                try:
+                    boot_payload = parse_call_result_payload(response)
+                except ValueError as exc:
+                    logger.error("BootNotification response error: %s", exc)
+                    span.set_attribute("ws.response_status", "Invalid")
+                    return 1
                 status = boot_payload.get("status")
                 if status != "Accepted":
                     logger.error("BootNotification not accepted: %s", status)
@@ -110,30 +158,111 @@ async def main() -> int:
                     interval = 10
                 span.set_attribute("ocpp.heartbeat_interval", interval)
                 span.set_attribute("ws.response_status", "Accepted")
+                logger.info("Boot accepted. Heartbeat interval=%s", interval)
 
-                heartbeat_count = 3
-                for idx in range(heartbeat_count):
-                    await asyncio.sleep(interval)
-                    heartbeat_call = make_heartbeat_call()
-                    heartbeat_uid = heartbeat_call[1]
-                    heartbeat_text = json.dumps(heartbeat_call)
-                    await websocket.send(heartbeat_text)
-                    heartbeat_response_text = await websocket.recv()
-                    logger.info("RAW RESPONSE: %s", heartbeat_response_text)
-                    try:
-                        heartbeat_response = parse_message(heartbeat_response_text)
-                    except json.JSONDecodeError:
-                        logger.error("Heartbeat %s: invalid JSON response", idx + 1)
-                        return 1
-                    logger.info("PARSED RESPONSE: %s", heartbeat_response)
-                    if (
-                        not is_call_result(heartbeat_response)
-                        or heartbeat_response[1] != heartbeat_uid
-                        or not isinstance(heartbeat_response[2], dict)
-                    ):
-                        logger.error("Heartbeat %s: invalid CALLRESULT", idx + 1)
-                        return 1
+                state = AVAILABLE
+                logger.info("State transition: %s -> %s", BOOTING, state)
+                status_call = make_status_notification_call(connector_id=0, status="Available", error_code="NoError")
+                status_uid = status_call[1]
+                await websocket.send(json.dumps(status_call))
+                logger.info("StatusNotification sent (Available)")
+                status_response_text = await websocket.recv()
+                logger.info("RAW RESPONSE: %s", status_response_text)
+                try:
+                    status_response = parse_message(status_response_text)
+                except json.JSONDecodeError:
+                    logger.error("StatusNotification: invalid JSON response")
+                    return 1
+                logger.info("PARSED RESPONSE: %s", status_response)
+                if not is_call_result(status_response) or status_response[1] != status_uid:
+                    logger.error("StatusNotification: invalid CALLRESULT")
+                    return 1
+                try:
+                    parse_call_result_payload(status_response)
+                except ValueError as exc:
+                    logger.error("StatusNotification response error: %s", exc)
+                    return 1
+                logger.info("StatusNotification acknowledged")
 
+                start_call = make_start_transaction_call(
+                    connector_id=1,
+                    id_tag="TEST",
+                    meter_start=0,
+                )
+                start_uid = start_call[1]
+                await websocket.send(json.dumps(start_call))
+                logger.info("StartTransaction sent (connectorId=1)")
+                start_response_text = await websocket.recv()
+                logger.info("RAW RESPONSE: %s", start_response_text)
+                try:
+                    start_response = parse_message(start_response_text)
+                except json.JSONDecodeError:
+                    logger.error("StartTransaction: invalid JSON response")
+                    return 1
+                logger.info("PARSED RESPONSE: %s", start_response)
+                if not is_call_result(start_response) or start_response[1] != start_uid:
+                    logger.error("StartTransaction: invalid CALLRESULT")
+                    return 1
+                try:
+                    start_payload = parse_call_result_payload(start_response)
+                except ValueError as exc:
+                    logger.error("StartTransaction response error: %s", exc)
+                    return 1
+                transaction_id = start_payload.get("transactionId")
+                id_tag_info = start_payload.get("idTagInfo", {})
+                if not isinstance(transaction_id, int):
+                    logger.error("StartTransaction: missing transactionId")
+                    return 1
+                if not isinstance(id_tag_info, dict) or id_tag_info.get("status") != "Accepted":
+                    logger.error("StartTransaction not accepted")
+                    return 1
+                session = SessionState(
+                    transaction_id=transaction_id,
+                    connector_id=1,
+                    meter_start=0,
+                    meter_stop=42,
+                )
+                logger.info("StartTransaction acknowledged (transactionId=%s)", session.transaction_id)
+
+                ws_lock = asyncio.Lock()
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_loop(websocket, interval, ws_lock, max_count=3)
+                )
+                await asyncio.sleep(10)
+
+                stop_call = make_stop_transaction_call(
+                    transaction_id=session.transaction_id,
+                    id_tag="TEST",
+                    meter_stop=session.meter_stop,
+                    reason="Local",
+                )
+                stop_uid = stop_call[1]
+                async with ws_lock:
+                    await websocket.send(json.dumps(stop_call))
+                    logger.info("StopTransaction sent (transactionId=%s)", session.transaction_id)
+                    stop_response_text = await websocket.recv()
+                logger.info("RAW RESPONSE: %s", stop_response_text)
+                try:
+                    stop_response = parse_message(stop_response_text)
+                except json.JSONDecodeError:
+                    logger.error("StopTransaction: invalid JSON response")
+                    return 1
+                logger.info("PARSED RESPONSE: %s", stop_response)
+                if not is_call_result(stop_response) or stop_response[1] != stop_uid:
+                    logger.error("StopTransaction: invalid CALLRESULT")
+                    return 1
+                try:
+                    stop_payload = parse_call_result_payload(stop_response)
+                except ValueError as exc:
+                    logger.error("StopTransaction response error: %s", exc)
+                    return 1
+                stop_tag_info = stop_payload.get("idTagInfo", {})
+                if not isinstance(stop_tag_info, dict) or stop_tag_info.get("status") != "Accepted":
+                    logger.error("StopTransaction not accepted")
+                    return 1
+                logger.info("StopTransaction acknowledged (transactionId=%s)", session.transaction_id)
+
+                await heartbeat_task
                 return 0
         except ConnectionRefusedError:
             logger.error("Could not connect to server")

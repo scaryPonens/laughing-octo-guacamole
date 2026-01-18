@@ -32,7 +32,9 @@ uv run python -m ocpp16_min.client
 ```
 
 Client connects to `ws://localhost:9000/CP_1`, sends a BootNotification,
-prints the response, and exits with code 0 only if it receives `Accepted`.
+sends one StatusNotification (Available), then StartTransaction and
+StopTransaction (after ~10 seconds). Heartbeats run during the
+simulated session. Exits with code 0 only on success.
 
 ## Tracing (OpenTelemetry + Jaeger)
 
@@ -56,15 +58,21 @@ INFO - Client connected: CP_1
 INFO - Received raw: [2,"...","BootNotification",{"chargePointVendor":"RalphCo",...}]
 INFO - Parsed CALL: action=BootNotification uid=...
 INFO - Sent: [3,"... ",{"status":"Accepted","currentTime":"2026-01-18T12:34:56Z","interval":10}]
+INFO - Received raw: [2,"...","StatusNotification",{"connectorId":0,"status":"Available","errorCode":"NoError",...}]
+INFO - Parsed CALL: action=StatusNotification uid=...
+INFO - StatusNotification: connectorId=0 status=Available
+INFO - Sent: [3,"... ",{}]
+INFO - Received raw: [2,"...","StartTransaction",{"connectorId":1,"idTag":"TEST","meterStart":0,"timestamp":"..."}]
+INFO - Parsed CALL: action=StartTransaction uid=...
+INFO - StartTransaction: chargePointId=CP_1 transactionId=1
+INFO - Sent: [3,"... ",{"transactionId":1,"idTagInfo":{"status":"Accepted"}}]
 INFO - Received raw: [2,"...","Heartbeat",{}]
 INFO - Parsed CALL: action=Heartbeat uid=...
 INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:06Z"}]
-INFO - Received raw: [2,"...","Heartbeat",{}]
-INFO - Parsed CALL: action=Heartbeat uid=...
-INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:16Z"}]
-INFO - Received raw: [2,"...","Heartbeat",{}]
-INFO - Parsed CALL: action=Heartbeat uid=...
-INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:26Z"}]
+INFO - Received raw: [2,"...","StopTransaction",{"transactionId":1,"meterStop":42,"timestamp":"...","reason":"Local","idTag":"TEST"}]
+INFO - Parsed CALL: action=StopTransaction uid=...
+INFO - StopTransaction: transactionId=1 meterStop=42
+INFO - Sent: [3,"... ",{"idTagInfo":{"status":"Accepted"}}]
 INFO - Client disconnected: CP_1
 ```
 
@@ -72,10 +80,20 @@ INFO - Client disconnected: CP_1
 ```
 RAW RESPONSE: [3,"... ",{"status":"Accepted","currentTime":"2026-01-18T12:34:56Z","interval":10}]
 PARSED RESPONSE: {'status': 'Accepted', 'currentTime': '2026-01-18T12:34:56Z', 'interval': 10}
+StatusNotification sent (Available)
+RAW RESPONSE: [3,"... ",{}]
+PARSED RESPONSE: {}
+StatusNotification acknowledged
+StartTransaction sent (connectorId=1)
+RAW RESPONSE: [3,"... ",{"transactionId":1,"idTagInfo":{"status":"Accepted"}}]
+PARSED RESPONSE: {'transactionId': 1, 'idTagInfo': {'status': 'Accepted'}}
+StartTransaction acknowledged (transactionId=1)
+Heartbeat 1 sent
 RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:06Z"}]
 PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:06Z'}
-RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:16Z"}]
-PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:16Z'}
-RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:26Z"}]
-PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:26Z'}
+Heartbeat 1 acknowledged
+StopTransaction sent (transactionId=1)
+RAW RESPONSE: [3,"... ",{"idTagInfo":{"status":"Accepted"}}]
+PARSED RESPONSE: {'idTagInfo': {'status': 'Accepted'}}
+StopTransaction acknowledged (transactionId=1)
 ```
