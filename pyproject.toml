@@ -2,7 +2,7 @@
 name = "ocpp16-min"
 version = "0.1.0"
 description = "Minimal OCPP 1.6-J BootNotification over WebSockets"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "opentelemetry-api>=1.24.0",
     "opentelemetry-exporter-otlp>=1.24.0",

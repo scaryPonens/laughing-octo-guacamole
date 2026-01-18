@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import sys
-import uuid
 
 import websockets
 from opentelemetry import propagate, trace
@@ -15,7 +14,13 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from .common import make_call, parse_message
+from .common import (
+    is_call_result,
+    make_call,
+    make_heartbeat_call,
+    new_uid,
+    parse_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +65,7 @@ async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
     logger.addHandler(SpanEventHandler())
     uri = "ws://localhost:9000/CP_1"
-    uid = str(uuid.uuid4())
+    uid = new_uid()
     payload = _boot_notification_payload()
     message = json.dumps(make_call(uid, "BootNotification", payload))
     with trace.get_tracer(__name__).start_as_current_span("ws.client") as span:
@@ -80,30 +85,59 @@ async def main() -> int:
                 await websocket.send(message)
                 response_text = await websocket.recv()
                 span.set_attribute("ws.response_text", response_text)
+                logger.info("RAW RESPONSE: %s", response_text)
+                try:
+                    response = parse_message(response_text)
+                except json.JSONDecodeError:
+                    logger.error("PARSED RESPONSE: <invalid JSON>")
+                    return 1
+
+                logger.info("PARSED RESPONSE: %s", response)
+                if not is_call_result(response) or response[1] != uid or not isinstance(response[2], dict):
+                    logger.error("BootNotification response is not a valid CALLRESULT")
+                    span.set_attribute("ws.response_status", "Invalid")
+                    return 1
+
+                boot_payload = response[2]
+                status = boot_payload.get("status")
+                if status != "Accepted":
+                    logger.error("BootNotification not accepted: %s", status)
+                    span.set_attribute("ws.response_status", "Rejected")
+                    return 1
+
+                interval = boot_payload.get("interval")
+                if not isinstance(interval, int) or interval <= 0:
+                    interval = 10
+                span.set_attribute("ocpp.heartbeat_interval", interval)
+                span.set_attribute("ws.response_status", "Accepted")
+
+                heartbeat_count = 3
+                for idx in range(heartbeat_count):
+                    await asyncio.sleep(interval)
+                    heartbeat_call = make_heartbeat_call()
+                    heartbeat_uid = heartbeat_call[1]
+                    heartbeat_text = json.dumps(heartbeat_call)
+                    await websocket.send(heartbeat_text)
+                    heartbeat_response_text = await websocket.recv()
+                    logger.info("RAW RESPONSE: %s", heartbeat_response_text)
+                    try:
+                        heartbeat_response = parse_message(heartbeat_response_text)
+                    except json.JSONDecodeError:
+                        logger.error("Heartbeat %s: invalid JSON response", idx + 1)
+                        return 1
+                    logger.info("PARSED RESPONSE: %s", heartbeat_response)
+                    if (
+                        not is_call_result(heartbeat_response)
+                        or heartbeat_response[1] != heartbeat_uid
+                        or not isinstance(heartbeat_response[2], dict)
+                    ):
+                        logger.error("Heartbeat %s: invalid CALLRESULT", idx + 1)
+                        return 1
+
+                return 0
         except ConnectionRefusedError:
             logger.error("Could not connect to server")
             return 1
-
-        logger.info("RAW RESPONSE: %s", response_text)
-        try:
-            response = parse_message(response_text)
-        except json.JSONDecodeError:
-            logger.error("PARSED RESPONSE: <invalid JSON>")
-            return 1
-
-        logger.info("PARSED RESPONSE: %s", response)
-        if (
-            isinstance(response, list)
-            and len(response) >= 3
-            and response[0] == 3
-            and response[1] == uid
-            and isinstance(response[2], dict)
-            and response[2].get("status") == "Accepted"
-        ):
-            span.set_attribute("ws.response_status", "Accepted")
-            return 0
-        span.set_attribute("ws.response_status", "Rejected")
-        return 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+{
+  "chat.agent.enabled": true,
+  "chat.agent.maxRequests": 15,
+  "github.copilot.chat.agent.runTasks": true,
+  "chat.mcp.discovery.enabled": {
+    "claude-desktop": true,
+    "windsurf": true,
+    "cursor-global": true,
+    "cursor-workspace": true
+  },
+  "github.copilot.chat.agent.autoFix": true,
+  "chat.tools.autoApprove": false,
+  "python.testing.pytestArgs": [
+    "ocpp16_min"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "makefile.configureOnOpen": false,
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/.venv/lib/python3.13/site-packages"
+  ],
+  "python.linting.enabled": true,
+  "python.linting.pylintEnabled": true,
+  "python.analysis.autoImportCompletions": true
+}

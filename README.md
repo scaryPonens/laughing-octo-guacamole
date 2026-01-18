@@ -6,13 +6,13 @@ charge point emulator and a server over WebSockets.
 ## Prerequisites
 
 - Python 3.11+
+- `uv` (https://docs.astral.sh/uv/)
 
-## Setup
+## Setup (uv)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+uv venv
+uv sync
 ```
 
 ## Run
@@ -20,7 +20,7 @@ pip install -e .
 ### Terminal 1: server
 
 ```bash
-python -m ocpp16_min.server
+uv run python -m ocpp16_min.server
 ```
 
 Server listens on `ws://localhost:9000/{chargePointId}`.
@@ -28,7 +28,7 @@ Server listens on `ws://localhost:9000/{chargePointId}`.
 ### Terminal 2: client
 
 ```bash
-python -m ocpp16_min.client
+uv run python -m ocpp16_min.client
 ```
 
 Client connects to `ws://localhost:9000/CP_1`, sends a BootNotification,
@@ -54,12 +54,28 @@ docker compose up --build
 ```
 INFO - Client connected: CP_1
 INFO - Received raw: [2,"...","BootNotification",{"chargePointVendor":"RalphCo",...}]
-INFO - Sent: [3,"... ",{"status":"Accepted","currentTime":"2026-01-18T12:34:56Z","interval":30}]
+INFO - Parsed CALL: action=BootNotification uid=...
+INFO - Sent: [3,"... ",{"status":"Accepted","currentTime":"2026-01-18T12:34:56Z","interval":10}]
+INFO - Received raw: [2,"...","Heartbeat",{}]
+INFO - Parsed CALL: action=Heartbeat uid=...
+INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:06Z"}]
+INFO - Received raw: [2,"...","Heartbeat",{}]
+INFO - Parsed CALL: action=Heartbeat uid=...
+INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:16Z"}]
+INFO - Received raw: [2,"...","Heartbeat",{}]
+INFO - Parsed CALL: action=Heartbeat uid=...
+INFO - Sent: [3,"... ",{"currentTime":"2026-01-18T12:35:26Z"}]
 INFO - Client disconnected: CP_1
 ```
 
 **Client**
 ```
-RAW RESPONSE: [3,"... ",{"status":"Accepted","currentTime":"2026-01-18T12:34:56Z","interval":30}]
-PARSED RESPONSE: {'status': 'Accepted', 'currentTime': '2026-01-18T12:34:56Z', 'interval': 30}
+RAW RESPONSE: [3,"... ",{"status":"Accepted","currentTime":"2026-01-18T12:34:56Z","interval":10}]
+PARSED RESPONSE: {'status': 'Accepted', 'currentTime': '2026-01-18T12:34:56Z', 'interval': 10}
+RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:06Z"}]
+PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:06Z'}
+RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:16Z"}]
+PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:16Z'}
+RAW RESPONSE: [3,"... ",{"currentTime":"2026-01-18T12:35:26Z"}]
+PARSED RESPONSE: {'currentTime': '2026-01-18T12:35:26Z'}
 ```

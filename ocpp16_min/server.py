@@ -14,11 +14,15 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from websockets.exceptions import ConnectionClosed
 
-from .common import make_call_result, parse_message, utc_now_iso_z
+try:
+    from .common import make_call_result, parse_message, utc_now_iso_z, validate_call
+except ImportError:  # Allows running as a script without -m
+    from common import make_call_result, parse_message, utc_now_iso_z, validate_call
 
 CALL = 2
 CALL_RESULT = 3
 CALL_ERROR = 4
+HEARTBEAT_INTERVAL_SECONDS = 10
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -89,34 +93,29 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
                     await _send_error_and_close(websocket, f"ERROR: invalid JSON ({exc.msg})")
                     return
 
-                if not isinstance(data, list):
-                    await _send_error_and_close(websocket, "ERROR: frame must be a JSON list")
-                    return
-                if len(data) != 4:
-                    await _send_error_and_close(websocket, "ERROR: CALL frame must have length 4")
-                    return
-
-                message_type, uid, action, payload = data
-                if message_type != CALL:
-                    await _send_error_and_close(websocket, "ERROR: MessageTypeId must be 2 (CALL)")
+                try:
+                    uid, action, payload = validate_call(data)
+                except ValueError as exc:
+                    await _send_error_and_close(websocket, f"ERROR: {exc}")
                     return
 
-                if action != "BootNotification":
-                    error = _call_error(uid, "NotSupported", "Only BootNotification is supported")
+                logger.info("Parsed CALL: action=%s uid=%s", action, uid)
+
+                if action == "BootNotification":
+                    result_payload = {
+                        "status": "Accepted",
+                        "currentTime": utc_now_iso_z(),
+                        "interval": HEARTBEAT_INTERVAL_SECONDS,
+                    }
+                elif action == "Heartbeat":
+                    result_payload = {"currentTime": utc_now_iso_z()}
+                else:
+                    error = _call_error(uid, "NotSupported", "Only BootNotification and Heartbeat are supported")
                     error_text = json.dumps(error)
                     await websocket.send(error_text)
                     logger.info("Sent: %s", error_text)
                     continue
 
-                if not isinstance(payload, dict):
-                    await _send_error_and_close(websocket, "ERROR: payload must be an object")
-                    return
-
-                result_payload = {
-                    "status": "Accepted",
-                    "currentTime": utc_now_iso_z(),
-                    "interval": 30,
-                }
                 response = make_call_result(uid, result_payload)
                 response_text = json.dumps(response)
                 await websocket.send(response_text)

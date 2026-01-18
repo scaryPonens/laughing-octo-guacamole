@@ -8,7 +8,7 @@ services:
 
   ocpp16-server:
     build: .
-    command: ["python", "-m", "ocpp16_min.server"]
+    command: ["uv", "run", "python", "-m", "ocpp16_min.server"]
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=9000
